@@ -1,0 +1,8 @@
+node_modules/
+dist/
+data/
+.discovery/
+.env
+.env.local
+*.log
+plan.md
