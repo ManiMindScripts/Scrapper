@@ -329,6 +329,30 @@ export const sources: SourceConfig[] = [
       "Next.js SPA. Dedicated adapter. Do not use Getro or generic-html.",
   },
   {
+    id: "inclimate",
+    displayName: "InClimate",
+    url: "https://www.inclimate.com/jobs?matching=true",
+    adapter: "inclimate",
+    platform: "inclimate",
+    pagination: "page_query",
+    jsonApi: {
+      status: "candidate",
+      url: "https://zebbhafpzjdsyawvhahy.supabase.co/rest/v1/rpc/search_jobs_v3",
+      notes: "Supabase RPC endpoint with public anon API key.",
+    },
+    viewJob: "on_site",
+    jobDescPolicy: "board_or_ats",
+    robots: {
+      url: "https://www.inclimate.com/robots.txt",
+      listingAllowed: true,
+      notes: "Public jobs API.",
+    },
+    enabled: true,
+    concurrencyGroup: "default",
+    notes:
+      "Modern climate-tech job board powered by Supabase search_jobs_v3 and get_public_job RPCs.",
+  },
+  {
     id: "climatetechlist",
     displayName: "ClimateTechList",
     url: "https://www.climatetechlist.com/jobs",

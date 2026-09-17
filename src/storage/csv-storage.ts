@@ -5,31 +5,31 @@ import csvWriterPkg from "csv-writer";
 import type { IJobStorage } from "./storage.interface.js";
 import type { Job, SaveOptions, StorageSaveResult } from "../types/job.types.js";
 import { JobSchema } from "../types/job.schema.js";
+import { parseSeniority } from "../parsers/seniority.parser.js";
+import { buildJobUniqueKey } from "../normalizer/job.normalizer.js";
 
 const { createObjectCsvWriter } = csvWriterPkg;
 
-export const CANONICAL_CSV_COLUMNS = [
-  "source",
-  "job_title",
-  "job_url",
-  "company_name",
-  "location_raw",
-  "is_remote",
-  "salary_raw",
-  "salary_min",
-  "salary_max",
-  "salary_currency",
-  "posted_at",
-  "job_desc",
-  "first_seen_at",
-  "last_seen_at",
-  "is_active",
+export const CSV_FIELD_MAPPINGS = [
+  { id: "company_name", title: "Company Name" },
+  { id: "job_title", title: "Job Title" },
+  { id: "job_desc", title: "Job Description" },
+  { id: "job_apply_url", title: "Job Appy Url" },
+  { id: "company_url", title: "Company Url" },
+  { id: "location", title: "Location" },
+  { id: "date_posted", title: "Date Posted" },
+  { id: "source_board", title: "Scourse Board" },
+  { id: "unique_key", title: "Unique Key" },
+  { id: "ceo_name", title: "Ceo Name" },
+  { id: "ceo_source_url", title: "Ceo Source Url" },
+  { id: "ceo_confidence", title: "Ceo Confidence" },
+  { id: "date_scraped", title: "Date Scraped" },
+  { id: "seniority", title: "Seniority" },
+  { id: "job_of_interest", title: "JOb of interest" },
 ] as const;
 
-export type CanonicalCsvColumn = (typeof CANONICAL_CSV_COLUMNS)[number];
-
-export function buildDedupeKey(source: string, jobUrl: string): string {
-  return `${source.trim().toLowerCase()}:::${jobUrl.trim().toLowerCase()}`;
+export function buildDedupeKey(uniqueKey: string): string {
+  return uniqueKey.trim().toLowerCase();
 }
 
 export class CsvStorage implements IJobStorage {
@@ -44,7 +44,7 @@ export class CsvStorage implements IJobStorage {
   }
 
   /**
-   * Reads existing jobs from CSV. Returns empty array if file does not exist.
+   * Reads existing jobs from CSV. Auto-detects and converts legacy and new formats.
    */
   async loadExisting(): Promise<Job[]> {
     if (!fs.existsSync(this.filePath)) {
@@ -66,40 +66,85 @@ export class CsvStorage implements IJobStorage {
 
     for (const record of rawRecords) {
       try {
-        const candidate: Job = {
-          source: (record["source"] ?? "").trim(),
-          job_title: (record["job_title"] ?? "").trim(),
-          job_url: (record["job_url"] ?? "").trim(),
-          company_name: (record["company_name"] ?? "").trim(),
-          location_raw: (record["location_raw"] ?? "").trim(),
-          is_remote: record["is_remote"] === "true",
-          salary_raw: (record["salary_raw"] ?? "").trim(),
-          salary_min:
-            record["salary_min"] && record["salary_min"].trim() !== ""
-              ? Number(record["salary_min"])
+        const isNewFormat = "Company Name" in record || "Unique Key" in record;
+
+        let candidate: Job;
+
+        if (isNewFormat) {
+          candidate = {
+            company_name: (record["Company Name"] ?? "").trim(),
+            job_title: (record["Job Title"] ?? "").trim(),
+            job_desc: (record["Job Description"] ?? "").trim(),
+            job_apply_url: (record["Job Appy Url"] ?? record["job_apply_url"] ?? "").trim(),
+            company_url: (record["Company Url"] ?? "").trim(),
+            location: (record["Location"] ?? "").trim(),
+            date_posted: record["Date Posted"] && record["Date Posted"].trim() !== ""
+              ? record["Date Posted"].trim()
               : null,
-          salary_max:
-            record["salary_max"] && record["salary_max"].trim() !== ""
-              ? Number(record["salary_max"])
-              : null,
-          salary_currency:
-            record["salary_currency"] && record["salary_currency"].trim() !== ""
-              ? record["salary_currency"].trim()
-              : null,
-          posted_at:
-            record["posted_at"] && record["posted_at"].trim() !== ""
+            source_board: (record["Scourse Board"] ?? record["source_board"] ?? "unknown").trim(),
+            unique_key: (record["Unique Key"] ?? "").trim(),
+            ceo_name: (record["Ceo Name"] ?? "N/A").trim(),
+            ceo_source_url: (record["Ceo Source Url"] ?? "").trim(),
+            ceo_confidence: (record["Ceo Confidence"] ?? "N/A").trim(),
+            date_scraped: (record["Date Scraped"] ?? new Date().toISOString()).trim(),
+            seniority: (record["Seniority"] ?? parseSeniority(record["Job Title"] || "")).trim(),
+            job_of_interest: (record["JOb of interest"] ?? "Yes").trim(),
+            is_active: record["is_active"] !== "false",
+            first_seen_at: record["first_seen_at"] || record["Date Scraped"] || new Date().toISOString(),
+            last_seen_at: record["last_seen_at"] || record["Date Scraped"] || new Date().toISOString(),
+          };
+
+          if (!candidate.unique_key) {
+            candidate.unique_key = buildJobUniqueKey(
+              candidate.company_name,
+              candidate.job_title,
+              candidate.location,
+              /remote/i.test(candidate.location),
+            );
+          }
+        } else {
+          // Legacy format migration
+          const companyName = (record["company_name"] ?? "").trim();
+          const jobTitle = (record["job_title"] ?? "").trim();
+          const locRaw = (record["location_raw"] ?? "").trim();
+          const isRemote = record["is_remote"] === "true";
+          const locationStr = locRaw
+            ? `${locRaw}${isRemote && !/remote/i.test(locRaw) ? " (Remote)" : ""}`
+            : isRemote
+              ? "Remote"
+              : "";
+
+          const uniqueKey = buildJobUniqueKey(companyName, jobTitle, locRaw, isRemote);
+          const seniority = parseSeniority(jobTitle);
+
+          candidate = {
+            company_name: companyName,
+            job_title: jobTitle,
+            job_desc: (record["job_desc"] ?? "").trim(),
+            job_apply_url: (record["job_url"] ?? "").trim(),
+            company_url: "",
+            location: locationStr,
+            date_posted: record["posted_at"] && record["posted_at"].trim() !== ""
               ? record["posted_at"].trim()
               : null,
-          job_desc: (record["job_desc"] ?? "").trim(),
-          first_seen_at: (record["first_seen_at"] ?? "").trim(),
-          last_seen_at: (record["last_seen_at"] ?? "").trim(),
-          is_active: record["is_active"] === "true",
-        };
+            source_board: (record["source"] ?? "unknown").trim(),
+            unique_key: uniqueKey,
+            ceo_name: "N/A",
+            ceo_source_url: "",
+            ceo_confidence: "N/A",
+            date_scraped: record["last_seen_at"] || record["first_seen_at"] || new Date().toISOString(),
+            seniority,
+            job_of_interest: "Yes",
+            is_active: record["is_active"] === "true",
+            first_seen_at: record["first_seen_at"] || new Date().toISOString(),
+            last_seen_at: record["last_seen_at"] || new Date().toISOString(),
+          };
+        }
 
         const validated = JobSchema.parse(candidate);
         jobs.push(validated);
       } catch {
-        // Skip unparseable or corrupted row gracefully
+        // Skip corrupted row gracefully
       }
     }
 
@@ -107,9 +152,9 @@ export class CsvStorage implements IJobStorage {
   }
 
   /**
-   * Reads existing CSV, merges fresh jobs by (source, job_url),
+   * Reads existing CSV, merges fresh jobs by Unique Key,
    * updates last_seen_at for seen jobs, sets first_seen_at for new jobs,
-   * deactivates absent jobs for the scraped sources, and safely writes to CSV.
+   * and safely writes to CSV.
    */
   async save(
     freshJobs: Job[],
@@ -122,7 +167,7 @@ export class CsvStorage implements IJobStorage {
     const jobMap = new Map<string, Job>();
 
     for (const job of existingJobs) {
-      const key = buildDedupeKey(job.source, job.job_url);
+      const key = buildDedupeKey(job.unique_key);
       jobMap.set(key, job);
     }
 
@@ -133,26 +178,34 @@ export class CsvStorage implements IJobStorage {
     const freshKeySet = new Set<string>();
 
     for (const freshJob of freshJobs) {
-      // Validate each fresh job with Zod before doing anything
       const validated = JobSchema.parse(freshJob);
-      const key = buildDedupeKey(validated.source, validated.job_url);
+      const key = buildDedupeKey(validated.unique_key);
       freshKeySet.add(key);
 
       const existing = jobMap.get(key);
       if (existing) {
-        // Update mutable fields and last_seen_at
+        // Update mutable fields, keep CEO info if already enriched
         const merged: Job = {
           ...existing,
           job_title: validated.job_title,
           company_name: validated.company_name || existing.company_name,
-          location_raw: validated.location_raw || existing.location_raw,
-          is_remote: validated.is_remote,
-          salary_raw: validated.salary_raw || existing.salary_raw,
-          salary_min: validated.salary_min ?? existing.salary_min,
-          salary_max: validated.salary_max ?? existing.salary_max,
-          salary_currency: validated.salary_currency ?? existing.salary_currency,
-          posted_at: validated.posted_at ?? existing.posted_at,
-          job_desc: validated.job_desc || existing.job_desc,
+          company_url: validated.company_url || existing.company_url,
+          location: validated.location || existing.location,
+          job_apply_url: validated.job_apply_url || existing.job_apply_url,
+          date_posted: validated.date_posted ?? existing.date_posted,
+          job_desc: validated.job_desc.length > existing.job_desc.length
+            ? validated.job_desc
+            : existing.job_desc,
+          ceo_name: existing.ceo_name && existing.ceo_name !== "N/A"
+            ? existing.ceo_name
+            : validated.ceo_name,
+          ceo_source_url: existing.ceo_source_url || validated.ceo_source_url,
+          ceo_confidence: existing.ceo_confidence && existing.ceo_confidence !== "N/A"
+            ? existing.ceo_confidence
+            : validated.ceo_confidence,
+          date_scraped: runIso,
+          seniority: validated.seniority || existing.seniority,
+          job_of_interest: validated.job_of_interest || existing.job_of_interest,
           last_seen_at: runIso,
           is_active: true,
         };
@@ -162,6 +215,7 @@ export class CsvStorage implements IJobStorage {
         // New posting
         const created: Job = {
           ...validated,
+          date_scraped: runIso,
           first_seen_at: runIso,
           last_seen_at: runIso,
           is_active: true,
@@ -178,11 +232,11 @@ export class CsvStorage implements IJobStorage {
 
     for (const [key, job] of jobMap.entries()) {
       const isCandidateForDeactivation = scrapedSources
-        ? scrapedSources.has(job.source.toLowerCase())
+        ? scrapedSources.has(job.source_board.toLowerCase())
         : true;
 
       if (isCandidateForDeactivation && !freshKeySet.has(key)) {
-        if (job.is_active) {
+        if (job.is_active !== false) {
           jobMap.set(key, {
             ...job,
             is_active: false,
@@ -192,16 +246,16 @@ export class CsvStorage implements IJobStorage {
       }
     }
 
-    // Sort: newest posted_at first, fallback to last_seen_at descending
+    // Sort: newest date_posted first, fallback to date_scraped descending
     const allJobs = Array.from(jobMap.values()).sort((a, b) => {
-      const aTime = a.posted_at ? new Date(a.posted_at).getTime() : 0;
-      const bTime = b.posted_at ? new Date(b.posted_at).getTime() : 0;
+      const aTime = a.date_posted ? new Date(a.date_posted).getTime() : 0;
+      const bTime = b.date_posted ? new Date(b.date_posted).getTime() : 0;
       if (aTime !== bTime) {
         return bTime - aTime;
       }
-      const aSeen = new Date(a.last_seen_at).getTime();
-      const bSeen = new Date(b.last_seen_at).getTime();
-      return bSeen - aSeen;
+      const aScraped = new Date(a.date_scraped).getTime();
+      const bScraped = new Date(b.date_scraped).getTime();
+      return bScraped - aScraped;
     });
 
     // Write back to CSV file
@@ -210,7 +264,7 @@ export class CsvStorage implements IJobStorage {
     let totalActive = 0;
     let alreadyInactive = 0;
     for (const job of allJobs) {
-      if (job.is_active) {
+      if (job.is_active !== false) {
         totalActive++;
       } else {
         alreadyInactive++;
@@ -233,29 +287,28 @@ export class CsvStorage implements IJobStorage {
       fs.mkdirSync(dir, { recursive: true });
     }
 
-    // Format records to exact primitive string representations
     const records = jobs.map((job) => ({
-      source: job.source,
-      job_title: job.job_title,
-      job_url: job.job_url,
       company_name: job.company_name,
-      location_raw: job.location_raw,
-      is_remote: job.is_remote ? "true" : "false",
-      salary_raw: job.salary_raw,
-      salary_min: job.salary_min != null ? String(job.salary_min) : "",
-      salary_max: job.salary_max != null ? String(job.salary_max) : "",
-      salary_currency: job.salary_currency ?? "",
-      posted_at: job.posted_at ?? "",
+      job_title: job.job_title,
       job_desc: job.job_desc,
-      first_seen_at: job.first_seen_at,
-      last_seen_at: job.last_seen_at,
-      is_active: job.is_active ? "true" : "false",
+      job_apply_url: job.job_apply_url,
+      company_url: job.company_url,
+      location: job.location,
+      date_posted: job.date_posted ?? "",
+      source_board: job.source_board,
+      unique_key: job.unique_key,
+      ceo_name: job.ceo_name,
+      ceo_source_url: job.ceo_source_url,
+      ceo_confidence: job.ceo_confidence,
+      date_scraped: job.date_scraped,
+      seniority: job.seniority,
+      job_of_interest: job.job_of_interest,
     }));
 
     const tmpFilePath = `${this.filePath}.tmp.${Date.now()}`;
     const writer = createObjectCsvWriter({
       path: tmpFilePath,
-      header: CANONICAL_CSV_COLUMNS.map((col) => ({ id: col, title: col })),
+      header: CSV_FIELD_MAPPINGS.map((m) => ({ id: m.id, title: m.title })),
     });
 
     await writer.writeRecords(records);
@@ -267,7 +320,6 @@ export class CsvStorage implements IJobStorage {
       }
       fs.renameSync(tmpFilePath, this.filePath);
     } catch {
-      // Fallback copy if rename fails across file system boundaries
       fs.copyFileSync(tmpFilePath, this.filePath);
       if (fs.existsSync(tmpFilePath)) {
         fs.unlinkSync(tmpFilePath);

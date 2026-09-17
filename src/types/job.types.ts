@@ -1,16 +1,17 @@
 /**
  * Source discovery config (Phase 1).
- * Canonical Job / RawJob types land in Phase 2.
+ * Canonical Job / RawJob types.
  */
 
 export type AdapterKind =
   | "getro"
   | "consider"
   | "climatebase"
+  | "inclimate"
   | "generic-html"
   | "large-aggregator";
 
-export type PlatformKind = "getro" | "custom";
+export type PlatformKind = "getro" | "inclimate" | "custom";
 
 export type PaginationKind =
   | "load_more"
@@ -33,7 +34,7 @@ export type JsonApiNote = {
 
 export type ViewJobKind = "on_site" | "external_ats" | "mixed" | "unknown";
 
-/** Phase 4 reads this. Never scrape LinkedIn job pages. */
+/** Never scrape LinkedIn job pages. */
 export type JobDescPolicy = "board_or_ats" | "skip_linkedin" | "unknown";
 
 export type RobotsNote = {
@@ -61,42 +62,57 @@ export type SourceConfig = {
 };
 
 /**
- * Raw job payload as extracted by platform adapters before normalization.
+ * Raw job payload as extracted by platform adapters before normalization and enrichment.
  */
 export type RawJob = {
   source: string;
   jobTitle: string;
   jobUrl: string;
   companyName?: string | undefined;
+  companyUrl?: string | undefined;
   locationRaw?: string | undefined;
   isRemote?: boolean | undefined;
   salaryRaw?: string | undefined;
   postedAtRaw?: string | undefined;
   jobDesc?: string | undefined;
+  applyUrl?: string | undefined;
 };
 
 /**
- * Canonical Job record corresponding 1:1 with data/jobs.csv columns:
- * source, job_title, job_url, company_name, location_raw, is_remote,
- * salary_raw, salary_min, salary_max, salary_currency, posted_at,
- * job_desc, first_seen_at, last_seen_at, is_active
+ * Enriched CEO data returned by the CEO enricher.
+ */
+export type CeoInfo = {
+  ceo_name: string;
+  ceo_source_url: string;
+  ceo_confidence: "High" | "Medium" | "Low" | "N/A";
+};
+
+/**
+ * Canonical Job record corresponding 1:1 with business CSV columns:
+ * Company Name, Job Title, Job Description, Job Appy Url, Company Url,
+ * Location, Date Posted, Scourse Board, Unique Key, Ceo Name,
+ * Ceo Source Url, Ceo Confidence, Date Scraped, Seniority, JOb of interest
  */
 export type Job = {
-  source: string;
-  job_title: string;
-  job_url: string;
   company_name: string;
-  location_raw: string;
-  is_remote: boolean;
-  salary_raw: string;
-  salary_min: number | null;
-  salary_max: number | null;
-  salary_currency: string | null;
-  posted_at: string | null;
+  job_title: string;
   job_desc: string;
-  first_seen_at: string;
-  last_seen_at: string;
-  is_active: boolean;
+  job_apply_url: string;
+  company_url: string;
+  location: string;
+  date_posted: string | null;
+  source_board: string;
+  unique_key: string;
+  ceo_name: string;
+  ceo_source_url: string;
+  ceo_confidence: string;
+  date_scraped: string;
+  seniority: string;
+  job_of_interest: string;
+  // Lifecycle tracking
+  first_seen_at?: string | undefined;
+  last_seen_at?: string | undefined;
+  is_active?: boolean | undefined;
 };
 
 export type StorageSaveResult = {
@@ -113,7 +129,6 @@ export type SaveOptions = {
    * IDs of sources that were successfully scraped in this run.
    * Jobs belonging to these sources that are absent in the fresh batch
    * will be marked is_active = false.
-   * Existing jobs belonging to skipped/failed sources are NOT deactivated.
    */
   scrapedSourceIds?: string[] | undefined;
   now?: Date | undefined;

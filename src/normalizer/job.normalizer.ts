@@ -1,30 +1,84 @@
-import type { Job, RawJob } from "../types/job.types.js";
+import type { Job, RawJob, CeoInfo } from "../types/job.types.js";
 import { JobSchema } from "../types/job.schema.js";
 import { parsePostedDate } from "../parsers/date.parser.js";
-import { parseSalary } from "../parsers/salary.parser.js";
+import { parseSeniority } from "../parsers/seniority.parser.js";
+import type { CeoEnricher } from "../enrichers/ceo.enricher.js";
 
 /**
- * Normalizes an adapter-specific RawJob into the canonical Job format,
- * parsing dates and salaries, setting initial timestamps, and validating against JobSchema.
+ * Builds a deterministic, cross-board unique key for global deduplication.
  */
-export function normalizeRawJob(raw: RawJob, now: Date = new Date()): Job {
+export function buildJobUniqueKey(
+  companyName: string,
+  jobTitle: string,
+  locationRaw: string,
+  isRemote: boolean,
+): string {
+  const cleanCompany = (companyName || "unknown")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+
+  const cleanTitle = (jobTitle || "unknown")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+
+  const locSignature = isRemote
+    ? "remote"
+    : (locationRaw || "unspecified")
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, "-")
+        .replace(/-+/g, "-")
+        .replace(/^-|-$/g, "");
+
+  return `${cleanCompany}:::${cleanTitle}:::${locSignature}`;
+}
+
+/**
+ * Normalizes an adapter-specific RawJob into the canonical 15-column Job format.
+ */
+export function normalizeRawJob(
+  raw: RawJob,
+  ceoInfo?: CeoInfo | undefined,
+  now: Date = new Date(),
+): Job {
   const nowIso = now.toISOString();
   const postedAt = parsePostedDate(raw.postedAtRaw, now);
-  const salary = parseSalary(raw.salaryRaw);
+  const isRemote = Boolean(raw.isRemote);
+  const locationStr = raw.locationRaw
+    ? `${raw.locationRaw.trim()}${isRemote && !/remote/i.test(raw.locationRaw) ? " (Remote)" : ""}`
+    : isRemote
+      ? "Remote"
+      : "";
+
+  const uniqueKey = buildJobUniqueKey(
+    raw.companyName || "",
+    raw.jobTitle || "",
+    raw.locationRaw || "",
+    isRemote,
+  );
+
+  const seniority = parseSeniority(raw.jobTitle || "");
+  const applyUrl = raw.applyUrl || raw.jobUrl || "";
 
   const candidate: Job = {
-    source: raw.source.trim(),
-    job_title: raw.jobTitle.trim(),
-    job_url: raw.jobUrl.trim(),
     company_name: (raw.companyName ?? "").trim(),
-    location_raw: (raw.locationRaw ?? "").trim(),
-    is_remote: Boolean(raw.isRemote),
-    salary_raw: (raw.salaryRaw ?? "").trim(),
-    salary_min: salary.min,
-    salary_max: salary.max,
-    salary_currency: salary.currency,
-    posted_at: postedAt,
+    job_title: (raw.jobTitle ?? "").trim(),
     job_desc: (raw.jobDesc ?? "").trim(),
+    job_apply_url: applyUrl.trim(),
+    company_url: (raw.companyUrl ?? "").trim(),
+    location: locationStr.trim(),
+    date_posted: postedAt,
+    source_board: raw.source.trim(),
+    unique_key: uniqueKey,
+    ceo_name: ceoInfo?.ceo_name || "N/A",
+    ceo_source_url: ceoInfo?.ceo_source_url || "",
+    ceo_confidence: ceoInfo?.ceo_confidence || "N/A",
+    date_scraped: nowIso,
+    seniority,
+    job_of_interest: "Yes",
     first_seen_at: nowIso,
     last_seen_at: nowIso,
     is_active: true,
@@ -34,21 +88,30 @@ export function normalizeRawJob(raw: RawJob, now: Date = new Date()): Job {
 }
 
 /**
- * Batch normalizes raw jobs, safely skipping or logging invalid records.
+ * Batch normalizes raw jobs with optional asynchronous CEO enrichment.
  */
-export function normalizeRawJobs(
+export async function normalizeRawJobs(
   rawJobs: RawJob[],
+  ceoEnricher?: CeoEnricher | undefined,
   now: Date = new Date(),
   onValidationError?: ((raw: RawJob, error: Error) => void) | undefined,
-): Job[] {
+): Promise<Job[]> {
   const normalized: Job[] = [];
 
   for (const raw of rawJobs) {
     try {
-      normalized.push(normalizeRawJob(raw, now));
+      let ceoInfo: CeoInfo | undefined;
+      if (ceoEnricher && raw.companyName) {
+        ceoInfo = await ceoEnricher.getCeoInfo(raw.companyName, raw.companyUrl);
+      }
+
+      normalized.push(normalizeRawJob(raw, ceoInfo, now));
     } catch (err) {
       if (onValidationError) {
-        onValidationError(raw, err instanceof Error ? err : new Error(String(err)));
+        onValidationError(
+          raw,
+          err instanceof Error ? err : new Error(String(err)),
+        );
       }
     }
   }

@@ -3,7 +3,8 @@ import type { IJobAdapter } from "../adapters/base.adapter.js";
 import type { IJobStorage } from "../storage/storage.interface.js";
 import type { BrowserManager } from "../browser/browser-manager.js";
 import { Logger, defaultLogger } from "./logger.js";
-import { normalizeRawJob } from "../normalizer/job.normalizer.js";
+import { normalizeRawJobs } from "../normalizer/job.normalizer.js";
+import type { CeoEnricher } from "../enrichers/ceo.enricher.js";
 import { RunSummary, type SourceRunStat } from "./run-summary.js";
 import { AlertManager, type PipelineAlert } from "./alert.js";
 import { withRetry } from "../utils/retry.js";
@@ -13,6 +14,7 @@ export interface RunScraperOptions {
   adapters: Map<AdapterKind, IJobAdapter>;
   storage: IJobStorage;
   browserManager?: BrowserManager | undefined;
+  ceoEnricher?: CeoEnricher | undefined;
   logger?: Logger | undefined;
   /**
    * When true (default in Phase 2 skeleton), only logs planned scrapes without executing browser/HTTP calls.
@@ -160,20 +162,18 @@ export async function runScraper(
         continue;
       }
 
-      const normalizedJobs: Job[] = [];
-      for (const raw of rawJobs) {
-        try {
-          const normalized = normalizeRawJob(raw);
-          normalizedJobs.push(normalized);
-        } catch (normErr) {
-          const errMsg =
-            normErr instanceof Error ? normErr.message : String(normErr);
+      const normalizedJobs = await normalizeRawJobs(
+        rawJobs,
+        options.ceoEnricher,
+        new Date(),
+        (raw, normErr) => {
+          const errMsg = normErr instanceof Error ? normErr.message : String(normErr);
           logger.warn(
             `Validation error on job '${raw.jobTitle}' (${raw.jobUrl}): ${errMsg}`,
             source.id,
           );
-        }
-      }
+        },
+      );
 
       allFreshJobs.push(...normalizedJobs);
       scrapedSources.push(source.id);

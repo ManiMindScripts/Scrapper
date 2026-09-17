@@ -5,10 +5,12 @@ import type { IJobAdapter } from "./adapters/base.adapter.js";
 import { StubAdapter } from "./adapters/stub.adapter.js";
 import { GetroAdapter } from "./adapters/getro.adapter.js";
 import { ClimatebaseAdapter } from "./adapters/climatebase.adapter.js";
+import { InclimateAdapter } from "./adapters/inclimate.adapter.js";
 import { GenericHtmlAdapter } from "./adapters/generic-html.adapter.js";
 import { ConsiderAdapter } from "./adapters/consider.adapter.js";
 import { CsvStorage } from "./storage/csv-storage.js";
 import { BrowserManager } from "./browser/browser-manager.js";
+import { CeoEnricher } from "./enrichers/ceo.enricher.js";
 import { Logger } from "./pipeline/logger.js";
 import { runScraper } from "./pipeline/run-scraper.js";
 import { Scheduler } from "./scheduler/scheduler.js";
@@ -17,12 +19,14 @@ async function main(): Promise<void> {
   const logger = new Logger({ level: "info" });
   const csvPath = path.resolve(process.cwd(), "data", "jobs.csv");
   const storage = new CsvStorage(csvPath);
+  const ceoEnricher = new CeoEnricher({ logger });
 
   // Register all live platform adapters
   const adapters = new Map<AdapterKind, IJobAdapter>([
-    ["getro", new GetroAdapter()],
+    ["getro", new GetroAdapter({ maxLoadMoreClicks: 100 })],
     ["consider", new ConsiderAdapter()],
-    ["climatebase", new ClimatebaseAdapter()],
+    ["climatebase", new ClimatebaseAdapter({ maxPages: 50 })],
+    ["inclimate", new InclimateAdapter({ maxJobs: 5000 })],
     ["generic-html", new GenericHtmlAdapter()],
     ["large-aggregator", new StubAdapter("large-aggregator")],
   ]);
@@ -46,6 +50,7 @@ async function main(): Promise<void> {
       adapters,
       storage,
       browserManager,
+      ceoEnricher,
       logger,
       dryRun: !isLiveFlag,
       sourceIds,
