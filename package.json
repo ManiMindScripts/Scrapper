@@ -7,6 +7,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
+    "server": "node dist/index.js --server",
+    "server:live": "node dist/index.js --server --live",
     "scrape:inclimate": "node scripts/scrape-inclimate.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --test dist/tests/**/*.test.js"

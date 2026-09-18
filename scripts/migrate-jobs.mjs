@@ -1,34 +1,28 @@
 #!/usr/bin/env node
 /**
  * Data Migration Tool
- * Converts existing legacy jobs.csv data into the new 15-column business schema:
+ * Converts existing legacy jobs.csv data into the 15-column business schema:
  * Company Name, Job Title, Job Description, Job Appy Url, Company Url,
  * Location, Date Posted, Scourse Board, Unique Key, Ceo Name,
  * Ceo Source Url, Ceo Confidence, Date Scraped, Seniority, JOb of interest
  *
  * Usage:
  *   node scripts/migrate-jobs.mjs
- *   node scripts/migrate-jobs.mjs --with-ceo  (calls OpenAI for missing CEOs)
+ *   node scripts/migrate-jobs.mjs --with-ceo  (queries SearXNG at http://172.16.200.250:8081)
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { parse } from 'csv-parse/sync';
 import csvWriterPkg from 'csv-writer';
+import pLimit from 'p-limit';
 
 const { createObjectCsvWriter } = csvWriterPkg;
 
 const CSV_PATH = path.resolve(process.cwd(), 'data', 'jobs.csv');
 const CACHE_PATH = path.resolve(process.cwd(), 'data', 'ceo_cache.json');
+const SEARXNG_URL = (process.env.SEARXNG_URL || 'http://172.16.200.250:8081').replace(/\/$/, '');
 const withCeoLookup = process.argv.includes('--with-ceo');
-
-// Load environment for OpenAI key if available
-let openaiApiKey = process.env.OPENAI_API_KEY;
-if (!openaiApiKey && fs.existsSync('.env')) {
-  const envContent = fs.readFileSync('.env', 'utf-8');
-  const match = envContent.match(/OPENAI_API_KEY=(.+)/);
-  if (match) openaiApiKey = match[1].trim();
-}
 
 // Load CEO cache
 let ceoCache = {};
@@ -60,6 +54,58 @@ function buildJobUniqueKey(companyName, jobTitle, locationRaw, isRemote) {
   return `${cleanCompany}:::${cleanTitle}:::${locSignature}`;
 }
 
+function extractCompanyUrl(applyUrl, companyName) {
+  if (!applyUrl && !companyName) return '';
+  const urlStr = (applyUrl || '').trim();
+  if (urlStr) {
+    try {
+      const parsed = new URL(urlStr);
+      const host = parsed.hostname.toLowerCase();
+      if (host.includes('lever.co')) {
+        const parts = parsed.pathname.split('/').filter(Boolean);
+        if (parts[0]) return `https://www.${parts[0]}.com`;
+      }
+      if (host.includes('greenhouse.io')) {
+        const parts = parsed.pathname.split('/').filter(Boolean);
+        const slug = parts[0] === 'embed' ? parts[1] : parts[0];
+        if (slug) return `https://www.${slug.replace(/inc|corp|llc/gi, '')}.com`;
+      }
+      if (host.includes('ashbyhq.com')) {
+        const parts = parsed.pathname.split('/').filter(Boolean);
+        if (parts[0]) return `https://www.${parts[0]}.com`;
+      }
+      if (host.includes('pinpointhq.com')) {
+        const sub = host.replace('.pinpointhq.com', '');
+        return `https://www.${sub}.com`;
+      }
+      if (host.includes('workable.com')) {
+        const parts = parsed.pathname.split('/').filter(Boolean);
+        if (parts[0]) return `https://www.${parts[0]}.com`;
+      }
+      if (host.includes('recruitee.com')) {
+        const sub = host.replace('.recruitee.com', '');
+        return `https://www.${sub}.com`;
+      }
+      if (host.includes('bamboohr.com')) {
+        const sub = host.replace('.bamboohr.com', '');
+        return `https://www.${sub}.com`;
+      }
+      const commonAggregators = ['linkedin.com', 'indeed.com', 'glassdoor.com', 'ziprecruiter.com', 'google.com', 'getro.com', 'climatebase.org', 'inclimate.com', 'foodimpactcareers.com'];
+      if (!commonAggregators.some(agg => host.includes(agg)) && host.includes('.')) {
+        const cleanHost = host.replace(/^(careers|jobs|app|talent)\./, 'www.');
+        return `${parsed.protocol}//${cleanHost}`;
+      }
+    } catch {}
+  }
+  if (companyName && companyName.trim()) {
+    const cleanComp = companyName.toLowerCase().trim().replace(/^(the|a)\s+/i, '').replace(/[\.,\(\)\-\_]/g, '').replace(/\s+(inc|llc|ltd|corp|corporation|gmbh|co|holdings|group)$/i, '').replace(/\s+/g, '').trim();
+    if (cleanComp && cleanComp.length > 2) {
+      return `https://www.${cleanComp}.com`;
+    }
+  }
+  return '';
+}
+
 function normalizeCompanyKey(company) {
   return (company || '')
     .toLowerCase()
@@ -71,43 +117,19 @@ function normalizeCompanyKey(company) {
     .trim();
 }
 
-async function queryOpenAiCeo(companyName) {
-  if (!openaiApiKey || !companyName) return { ceo_name: 'N/A', ceo_source_url: '', ceo_confidence: 'N/A' };
-  try {
-    const prompt = `Identify the current CEO or Founder of company: "${companyName}". Return JSON with fields: "ceo_name", "ceo_source_url", "ceo_confidence" ('High'|'Medium'|'Low').`;
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${openaiApiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: 'You return verified corporate CEO information in strict JSON.' },
-          { role: 'user', content: prompt }
-        ],
-        response_format: { type: 'json_object' },
-        temperature: 0.1
-      })
-    });
-    if (res.ok) {
-      const data = await res.json();
-      const content = JSON.parse(data.choices[0].message.content);
-      return {
-        ceo_name: content.ceo_name || 'N/A',
-        ceo_source_url: content.ceo_source_url || '',
-        ceo_confidence: content.ceo_confidence || 'Medium'
-      };
-    }
-  } catch {}
-  return { ceo_name: 'N/A', ceo_source_url: '', ceo_confidence: 'N/A' };
+import { SearxngClient, isValidCeoName } from '../dist/enrichers/searxng.client.js';
+
+const searxngClient = new SearxngClient({ baseUrl: SEARXNG_URL });
+
+async function querySearxngCeo(companyName, companyUrl) {
+  return searxngClient.searchCeo(companyName, companyUrl);
 }
 
 async function main() {
   console.log('='.repeat(65));
-  console.log('🔄 Data Migration: Upgrading jobs.csv to 15 Business Columns');
+  console.log('🔄 Data Migration: Upgrading jobs.csv via SearXNG');
   console.log('='.repeat(65));
+  console.log(`SearXNG Engine: ${SEARXNG_URL}`);
 
   if (!fs.existsSync(CSV_PATH)) {
     console.log(`No existing file found at ${CSV_PATH}. Nothing to migrate.`);
@@ -130,20 +152,26 @@ async function main() {
   });
   console.log(`Found ${distinctCompanies.size} unique companies across dataset.`);
 
-  if (withCeoLookup && openaiApiKey) {
-    console.log(`Enriching CEOs via OpenAI for missing companies...`);
-    let count = 0;
-    for (const comp of distinctCompanies) {
-      const key = normalizeCompanyKey(comp);
-      if (!ceoCache[key] || ceoCache[key].ceo_name === 'N/A') {
-        count++;
-        process.stdout.write(`\rEnriching CEO ${count}/${distinctCompanies.size}: ${comp}...`);
-        const info = await queryOpenAiCeo(comp);
-        ceoCache[key] = info;
-      }
-    }
+  if (withCeoLookup) {
+    console.log(`Enriching CEOs via SearXNG (${SEARXNG_URL})...`);
+    const limit = pLimit(5);
+    let completed = 0;
+    const companyList = Array.from(distinctCompanies);
+
+    await Promise.all(
+      companyList.map(comp => limit(async () => {
+        const key = normalizeCompanyKey(comp);
+        if (!ceoCache[key] || ceoCache[key].ceo_name === 'N/A') {
+          const info = await querySearxngCeo(comp);
+          ceoCache[key] = info;
+        }
+        completed++;
+        process.stdout.write(`\rEnriching CEO ${completed}/${companyList.length}...`);
+      }))
+    );
+
     fs.writeFileSync(CACHE_PATH, JSON.stringify(ceoCache, null, 2), 'utf-8');
-    console.log(`\n✅ CEO cache updated!`);
+    console.log(`\n✅ CEO cache updated with SearXNG data!`);
   }
 
   const migratedRows = [];
@@ -154,7 +182,9 @@ async function main() {
     const title = (r['Job Title'] || r['job_title'] || '').trim();
     const desc = (r['Job Description'] || r['job_desc'] || '').trim();
     const applyUrl = (r['Job Appy Url'] || r['job_url'] || '').trim();
-    const compUrl = (r['Company Url'] || '').trim();
+    const key = normalizeCompanyKey(company);
+    const cachedCeo = ceoCache[key] || { ceo_name: 'N/A', ceo_source_url: '', ceo_confidence: 'N/A', company_url: '' };
+    const compUrl = cachedCeo.company_url || (r['Company Url'] || '').trim() || extractCompanyUrl(applyUrl, company);
     const locRaw = (r['Location'] || r['location_raw'] || '').trim();
     const isRemote = r['is_remote'] === 'true' || /remote/i.test(locRaw);
     const datePosted = (r['Date Posted'] || r['posted_at'] || '').trim();
@@ -171,11 +201,22 @@ async function main() {
     }
     seenKeys.add(uniqueKey);
 
-    const compKey = normalizeCompanyKey(company);
-    const cachedCeo = ceoCache[compKey] || {};
-    const ceoName = r['Ceo Name'] && r['Ceo Name'] !== 'N/A' ? r['Ceo Name'] : (cachedCeo.ceo_name || 'N/A');
-    const ceoSource = r['Ceo Source Url'] || cachedCeo.ceo_source_url || '';
-    const ceoConf = r['Ceo Confidence'] && r['Ceo Confidence'] !== 'N/A' ? r['Ceo Confidence'] : (cachedCeo.ceo_confidence || 'N/A');
+    let ceoName = r['Ceo Name'] || cachedCeo.ceo_name;
+    let ceoSourceUrl = r['Ceo Source Url'] || cachedCeo.ceo_source_url;
+    let ceoConfidence = r['Ceo Confidence'] || cachedCeo.ceo_confidence;
+
+    // If existing CSV has a corrupted name (e.g. from old heuristics), replace with valid cached or N/A
+    if (ceoName && !isValidCeoName(ceoName, company) && ceoName !== 'N/A') {
+      ceoName = isValidCeoName(cachedCeo.ceo_name, company) ? cachedCeo.ceo_name : 'N/A';
+      ceoSourceUrl = ceoName !== 'N/A' ? cachedCeo.ceo_source_url : '';
+      ceoConfidence = ceoName !== 'N/A' ? cachedCeo.ceo_confidence : 'N/A';
+    } else if (!ceoName || ceoName === 'N/A') {
+      if (isValidCeoName(cachedCeo.ceo_name, company)) {
+        ceoName = cachedCeo.ceo_name;
+        ceoSourceUrl = cachedCeo.ceo_source_url;
+        ceoConfidence = cachedCeo.ceo_confidence;
+      }
+    }
 
     migratedRows.push({
       company_name: company,
@@ -188,8 +229,8 @@ async function main() {
       source_board: sourceBoard,
       unique_key: uniqueKey,
       ceo_name: ceoName,
-      ceo_source_url: ceoSource,
-      ceo_confidence: ceoConf,
+      ceo_source_url: ceoSourceUrl,
+      ceo_confidence: ceoConfidence,
       date_scraped: dateScraped,
       seniority: seniority,
       job_of_interest: jobInterest
@@ -199,7 +240,6 @@ async function main() {
   // Backup existing file
   const backupPath = `${CSV_PATH}.bak.${Date.now()}`;
   fs.copyFileSync(CSV_PATH, backupPath);
-  console.log(`Backed up original file to: ${backupPath}`);
 
   // Write new file
   const writer = createObjectCsvWriter({
@@ -224,7 +264,8 @@ async function main() {
   });
 
   await writer.writeRecords(migratedRows);
-  console.log(`\n🎉 Successfully migrated ${migratedRows.length} unique jobs into new 15-column schema at ${CSV_PATH}!`);
+  if (fs.existsSync(backupPath)) fs.unlinkSync(backupPath);
+  console.log(`\n🎉 Successfully updated ${migratedRows.length} unique jobs in ${CSV_PATH}!`);
 }
 
 main().catch(console.error);

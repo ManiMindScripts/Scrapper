@@ -14,6 +14,7 @@ import { CeoEnricher } from "./enrichers/ceo.enricher.js";
 import { Logger } from "./pipeline/logger.js";
 import { runScraper } from "./pipeline/run-scraper.js";
 import { Scheduler } from "./scheduler/scheduler.js";
+import { ScraperServer } from "./server/server.js";
 
 async function main(): Promise<void> {
   const logger = new Logger({ level: "info" });
@@ -34,6 +35,14 @@ async function main(): Promise<void> {
   const browserManager = new BrowserManager({ headless: true });
 
   const isLiveFlag = process.argv.includes("--live");
+  const isServerFlag =
+    process.argv.includes("--server") ||
+    process.argv.some((arg) => arg.startsWith("--port"));
+  const portArg = process.argv
+    .find((arg) => arg.startsWith("--port="))
+    ?.replace("--port=", "");
+  const port = portArg ? Number(portArg) : Number(process.env.PORT) || 3000;
+
   const sourceArg = process.argv
     .find((arg) => arg.startsWith("--source="))
     ?.replace("--source=", "");
@@ -57,11 +66,38 @@ async function main(): Promise<void> {
     });
   };
 
+  if (isServerFlag) {
+    // HTTP API Server Mode
+    const server = new ScraperServer({
+      port,
+      sources,
+      adapters,
+      storage,
+      browserManager,
+      ceoEnricher,
+      logger,
+    });
+
+    const shutdown = async () => {
+      logger.info("Received shutdown signal. Stopping HTTP server...", "main");
+      await server.stop();
+      await browserManager.close();
+      process.exit(0);
+    };
+
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+
+    await server.start();
+    return;
+  }
+
   if (scheduleArg) {
     // Scheduled daemon mode
     let cronExpr = "0 6 * * *"; // Default daily at 06:00
     if (scheduleArg.includes("=")) {
-      cronExpr = scheduleArg.split("=")[1]?.replace(/^["']|["']$/g, "") || cronExpr;
+      cronExpr =
+        scheduleArg.split("=")[1]?.replace(/^["']|["']$/g, "") || cronExpr;
     }
 
     const scheduler = new Scheduler({

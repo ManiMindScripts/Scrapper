@@ -2,6 +2,7 @@ import type { Job, RawJob, CeoInfo } from "../types/job.types.js";
 import { JobSchema } from "../types/job.schema.js";
 import { parsePostedDate } from "../parsers/date.parser.js";
 import { parseSeniority } from "../parsers/seniority.parser.js";
+import { extractCompanyUrl } from "../parsers/company-url.parser.js";
 import type { CeoEnricher } from "../enrichers/ceo.enricher.js";
 
 /**
@@ -62,13 +63,17 @@ export function normalizeRawJob(
 
   const seniority = parseSeniority(raw.jobTitle || "");
   const applyUrl = raw.applyUrl || raw.jobUrl || "";
+  const companyUrl =
+    raw.companyUrl ||
+    ceoInfo?.company_url ||
+    extractCompanyUrl(applyUrl, raw.companyName);
 
   const candidate: Job = {
     company_name: (raw.companyName ?? "").trim(),
     job_title: (raw.jobTitle ?? "").trim(),
     job_desc: (raw.jobDesc ?? "").trim(),
     job_apply_url: applyUrl.trim(),
-    company_url: (raw.companyUrl ?? "").trim(),
+    company_url: companyUrl.trim(),
     location: locationStr.trim(),
     date_posted: postedAt,
     source_board: raw.source.trim(),

@@ -85,6 +85,7 @@ export type CeoInfo = {
   ceo_name: string;
   ceo_source_url: string;
   ceo_confidence: "High" | "Medium" | "Low" | "N/A";
+  company_url?: string | undefined;
 };
 
 /**

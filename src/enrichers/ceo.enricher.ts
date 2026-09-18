@@ -2,29 +2,34 @@ import fs from "node:fs";
 import path from "node:path";
 import type { CeoInfo } from "../types/job.types.js";
 import { Logger, defaultLogger } from "../pipeline/logger.js";
+import { SearxngClient, isValidCeoName } from "./searxng.client.js";
 
 export interface CeoEnricherOptions {
-  apiKey?: string | undefined;
+  searxngUrl?: string | undefined;
   cacheFilePath?: string | undefined;
-  model?: string | undefined;
   logger?: Logger | undefined;
 }
 
 export class CeoEnricher {
-  private readonly apiKey: string | undefined;
+  private readonly searxngClient: SearxngClient;
   private readonly cacheFilePath: string;
-  private readonly model: string;
   private readonly logger: Logger;
   private cache: Map<string, CeoInfo> = new Map();
   private isDirty = false;
 
   constructor(options: CeoEnricherOptions = {}) {
-    this.apiKey = options.apiKey || process.env.OPENAI_API_KEY || undefined;
+    this.logger = options.logger || defaultLogger;
+    this.searxngClient = new SearxngClient({
+      baseUrl:
+        options.searxngUrl ||
+        process.env.SEARXNG_URL ||
+        "http://172.16.200.250:8081",
+      logger: this.logger,
+    });
+
     this.cacheFilePath =
       options.cacheFilePath ||
       path.resolve(process.cwd(), "data", "ceo_cache.json");
-    this.model = options.model || "gpt-4o-mini";
-    this.logger = options.logger || defaultLogger;
 
     this.loadCache();
   }
@@ -46,18 +51,31 @@ export class CeoEnricher {
         const content = fs.readFileSync(this.cacheFilePath, "utf-8");
         if (content.trim()) {
           const parsed = JSON.parse(content) as Record<string, CeoInfo>;
+          let validCount = 0;
+          let purgedCount = 0;
           for (const [key, value] of Object.entries(parsed)) {
-            this.cache.set(key, value);
+            // Validate that cached CEO name is valid or explicitly "N/A"
+            if (value.ceo_name === "N/A" || isValidCeoName(value.ceo_name, key)) {
+              this.cache.set(key, value);
+              validCount++;
+            } else {
+              // Corrupt or invalid entry from old heuristic -> purge so it gets re-extracted
+              purgedCount++;
+              this.isDirty = true;
+            }
+          }
+          if (purgedCount > 0) {
+            this.saveCache();
           }
           this.logger.debug(
-            `Loaded ${this.cache.size} cached CEO entries from ${this.cacheFilePath}`,
+            `Loaded ${validCount} valid cached entries from ${this.cacheFilePath} (${purgedCount} purged)`,
             "ceo-enricher",
           );
         }
       }
     } catch (err) {
       this.logger.warn(
-        `Failed to load CEO cache from ${this.cacheFilePath}: ${err instanceof Error ? err.message : String(err)}`,
+        `Failed to load cache from ${this.cacheFilePath}: ${err instanceof Error ? err.message : String(err)}`,
         "ceo-enricher",
       );
     }
@@ -77,12 +95,12 @@ export class CeoEnricher {
       fs.writeFileSync(this.cacheFilePath, JSON.stringify(obj, null, 2), "utf-8");
       this.isDirty = false;
       this.logger.debug(
-        `Saved ${this.cache.size} CEO entries to ${this.cacheFilePath}`,
+        `Saved ${this.cache.size} company profiles to ${this.cacheFilePath}`,
         "ceo-enricher",
       );
     } catch (err) {
       this.logger.warn(
-        `Failed to write CEO cache to ${this.cacheFilePath}: ${err instanceof Error ? err.message : String(err)}`,
+        `Failed to write cache to ${this.cacheFilePath}: ${err instanceof Error ? err.message : String(err)}`,
         "ceo-enricher",
       );
     }
@@ -97,6 +115,7 @@ export class CeoEnricher {
         ceo_name: "N/A",
         ceo_source_url: "",
         ceo_confidence: "N/A",
+        company_url: companyUrl || "",
       };
     }
 
@@ -104,87 +123,32 @@ export class CeoEnricher {
 
     // 1. Check local persistent cache
     if (this.cache.has(key)) {
-      return this.cache.get(key)!;
+      const cached = this.cache.get(key)!;
+      if (cached.ceo_name === "N/A" || isValidCeoName(cached.ceo_name, companyName)) {
+        if (!cached.company_url && companyUrl) {
+          cached.company_url = companyUrl;
+          this.isDirty = true;
+          this.saveCache();
+        }
+        return cached;
+      }
     }
 
-    // 2. If no OpenAI key configured, return fallback
-    if (!this.apiKey) {
-      const fallback: CeoInfo = {
-        ceo_name: "N/A",
-        ceo_source_url: "",
-        ceo_confidence: "N/A",
-      };
-      this.cache.set(key, fallback);
-      this.isDirty = true;
-      return fallback;
-    }
-
-    // 3. Call OpenAI gpt-4o-mini
+    // 2. Query SearXNG meta-search engine
     try {
-      const prompt = `Identify the current CEO (Chief Executive Officer) or Founder of the following company:
-Company Name: "${companyName}"
-${companyUrl ? `Company Website: "${companyUrl}"` : ""}
+      const info = await this.searxngClient.searchCeo(
+        companyName,
+        companyUrl,
+      );
 
-Return a JSON object with exactly these fields:
-{
-  "ceo_name": "Full Name of current CEO (or Founder if no CEO, or 'N/A' if unknown)",
-  "ceo_source_url": "URL or domain where this information is verified (e.g., company website, Wikipedia, LinkedIn, or Crunchbase)",
-  "ceo_confidence": "High" | "Medium" | "Low" | "N/A"
-}`;
-
-      const res = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: this.model,
-          messages: [
-            {
-              role: "system",
-              content:
-                "You are an executive research assistant. You return accurate corporate leadership and CEO data in strictly valid JSON format.",
-            },
-            {
-              role: "user",
-              content: prompt,
-            },
-          ],
-          response_format: { type: "json_object" },
-          temperature: 0.1,
-        }),
-      });
-
-      if (!res.ok) {
-        throw new Error(`OpenAI API error ${res.status}: ${res.statusText}`);
-      }
-
-      const json = await res.json();
-      const rawContent = json.choices?.[0]?.message?.content;
-      if (!rawContent) {
-        throw new Error("Empty completion from OpenAI");
-      }
-
-      const parsed = JSON.parse(rawContent) as Partial<CeoInfo>;
-      const ceoInfo: CeoInfo = {
-        ceo_name: parsed.ceo_name?.trim() || "N/A",
-        ceo_source_url: parsed.ceo_source_url?.trim() || "",
-        ceo_confidence: (["High", "Medium", "Low"].includes(
-          parsed.ceo_confidence || "",
-        )
-          ? parsed.ceo_confidence
-          : "Medium") as CeoInfo["ceo_confidence"],
-      };
-
-      this.cache.set(key, ceoInfo);
+      this.cache.set(key, info);
       this.isDirty = true;
       this.saveCache();
 
-      return ceoInfo;
+      return info;
     } catch (err) {
       this.logger.warn(
-        `Failed to enrich CEO for company '${companyName}': ${err instanceof Error ? err.message : String(err)}`,
+        `Failed to enrich company '${companyName}' via SearXNG: ${err instanceof Error ? err.message : String(err)}`,
         "ceo-enricher",
       );
 
@@ -192,6 +156,7 @@ Return a JSON object with exactly these fields:
         ceo_name: "N/A",
         ceo_source_url: "",
         ceo_confidence: "N/A",
+        company_url: companyUrl || "",
       };
       this.cache.set(key, fallback);
       this.isDirty = true;
